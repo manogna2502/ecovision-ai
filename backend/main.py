@@ -1,28 +1,11 @@
-"""
-EcoVision AI - Detection backend
-Runs a pretrained computer vision model (prithivMLmods/Trash-Net, SigLIP)
-to classify waste type from an uploaded image, derives a risk score and
-cleanup priority, and PERSISTS every detection to Postgres (Supabase).
-
-Run locally:
-    pip install -r requirements.txt
-    cp .env.example .env   # then fill in DATABASE_URL
-    uvicorn main:app --reload --port 8000
-
-Test:
-    curl -X POST http://localhost:8000/api/detect -F "file=@sample.jpg"
-    curl http://localhost:8000/api/stats
-    curl http://localhost:8000/api/detections
-"""
-
 import io
 import os
 import time
+import gc
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import List, Optional
-
 import torch
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
@@ -83,11 +66,24 @@ def on_startup():
 
 @lru_cache(maxsize=1)
 def get_model():
-    """Load model + processor once and cache them across requests."""
+    """Load model + processor once and cache them across requests.
+
+    Loaded with low_cpu_mem_usage to reduce peak RAM during load, then
+    dynamically quantized (float32 -> int8 on Linear layers) to cut the
+    model's resident memory footprint substantially for tight free-tier
+    RAM limits. Small accuracy trade-off, worth it to fit in 512MB.
+    """
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-    model = SiglipForImageClassification.from_pretrained(MODEL_NAME)
+    model = SiglipForImageClassification.from_pretrained(
+        MODEL_NAME, low_cpu_mem_usage=True
+    )
     model.eval()
-    return processor, model
+    quantized_model = torch.quantization.quantize_dynamic(
+        model, {torch.nn.Linear}, dtype=torch.qint8
+    )
+    del model
+    gc.collect()
+    return processor, quantized_model
 
 
 # Heuristic risk weighting per class. This is a rule-based layer applied on
