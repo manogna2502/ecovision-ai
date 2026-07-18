@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --border: 214 32% 91%;
+    --primary: 221 83% 53%;        /* Royal Blue #2563EB */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 189 94% 43%;      /* Cyan #06B6D4 */
+    --secondary-foreground: 0 0% 100%;
+    --accent: 158 64% 40%;         /* Emerald #10B981 */
+    --accent-foreground: 0 0% 100%;
+  }
+
+  .dark {
+    --background: 222 47% 6%;      /* #0B1120 */
+    --foreground: 210 40% 96%;
+    --card: 222 39% 11%;           /* #111827 */
+    --card-foreground: 210 40% 96%;
+    --muted: 217 33% 17%;          /* #1E293B */
+    --muted-foreground: 215 20% 65%;
+    --border: 217 33% 20%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 6%;
+    --secondary: 189 94% 53%;
+    --secondary-foreground: 222 47% 6%;
+    --accent: 158 64% 52%;
+    --accent-foreground: 222 47% 6%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply bg-card/60 backdrop-blur-xl border border-border/60;
+  }
+  .glow-border {
+    position: relative;
+  }
+  .glow-border::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, hsl(var(--primary)), hsl(var(--secondary)));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+}
