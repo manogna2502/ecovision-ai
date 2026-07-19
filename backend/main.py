@@ -48,11 +48,11 @@ def get_session():
 
 # --- App setup --------------------------------------------------------------
 app = FastAPI(title="EcoVision AI Detection API")
-
-# CORS Configuration - Allow all origins (can restrict to Vercel URL later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=[
+        "https://ecovision-ai-nine.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
