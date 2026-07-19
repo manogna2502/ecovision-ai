@@ -20,9 +20,7 @@ load_dotenv()
 MODEL_NAME = "prithivMLmods/Trash-Net"
 
 # --- Database setup -------------------------------------------------------
-# Get this from Supabase: Project Settings -> Database -> Connection string (URI)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ecovision.db")
-# Supabase/most providers give "postgres://"; SQLAlchemy 1.4+/2.x wants "postgresql://"
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -51,12 +49,10 @@ def get_session():
 # --- App setup --------------------------------------------------------------
 app = FastAPI(title="EcoVision AI Detection API")
 
+# CORS Configuration - Allow all origins (can restrict to Vercel URL later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://ecovision-ai-nine.vercel.app",
-        "http://localhost:5173",
-    ],
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -71,11 +67,8 @@ def on_startup():
 @lru_cache(maxsize=1)
 def get_model():
     """Load model + processor once and cache them across requests.
-
-    Loaded with low_cpu_mem_usage to reduce peak RAM during load, then
-    dynamically quantized (float32 -> int8 on Linear layers) to cut the
-    model's resident memory footprint substantially for tight free-tier
-    RAM limits. Small accuracy trade-off, worth it to fit in 512MB.
+    
+    Quantized to int8 for memory efficiency on free-tier Render (512MB RAM).
     """
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
     model = SiglipForImageClassification.from_pretrained(
@@ -90,23 +83,21 @@ def get_model():
     return processor, quantized_model
 
 
-# Heuristic risk weighting per class. This is a rule-based layer applied on
-# top of the real model output -- it is transparent about being a heuristic,
-# not a second ML model, and should be explained as such in your problem
-# statement / demo.
+# Risk weighting per waste class
 CLASS_RISK_WEIGHT = {
     "cardboard": 0.2,
     "paper": 0.2,
     "glass": 0.5,
     "metal": 0.5,
     "plastic": 0.6,
-    "trash": 0.9,  # unsorted / mixed waste -> treated as highest concern
+    "trash": 0.9,
 }
 
 
 def risk_from_prediction(label: str, confidence: float):
+    """Calculate risk score from label and confidence."""
     base = CLASS_RISK_WEIGHT.get(label.lower(), 0.5)
-    score = round(base * confidence * 10, 1)  # 0-10 scale
+    score = round(base * confidence * 10, 1)
 
     if score >= 7:
         risk, priority = "Critical", "Critical"
@@ -122,6 +113,7 @@ def risk_from_prediction(label: str, confidence: float):
 
 @app.get("/api/health")
 def health(session: Session = Depends(get_session)):
+    """Health check endpoint."""
     db_ok = True
     try:
         session.exec(select(func.count(Detection.id))).one()
@@ -132,22 +124,24 @@ def health(session: Session = Depends(get_session)):
 
 @app.post("/api/detect")
 async def detect(file: UploadFile = File(...), session: Session = Depends(get_session)):
+    """Main detection endpoint - classify waste image."""
     try:
+        # Validate file is an image
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Please upload an image file.")
 
+        # Read file
         raw = await file.read()
+        print(f"Filename: {file.filename}, Size: {len(raw)} bytes")
 
-        print("Filename:", file.filename)
-        print("Content Type:", file.content_type)
-        print("Image Size:", len(raw))
-
+        # Load image
         image = Image.open(io.BytesIO(raw)).convert("RGB")
 
+        # Get model
         processor, model = get_model()
 
+        # Run inference
         start = time.time()
-
         inputs = processor(images=image, return_tensors="pt")
 
         with torch.no_grad():
@@ -157,8 +151,8 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
 
         inference_ms = round((time.time() - start) * 1000, 1)
 
+        # Format predictions
         id2label = model.config.id2label
-
         predictions = sorted(
             [
                 {
@@ -172,12 +166,12 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         )
 
         top = predictions[0]
-
         score, risk, priority = risk_from_prediction(
             top["label"],
             top["confidence"] / 100,
         )
 
+        # Save to database
         record = Detection(
             filename=file.filename,
             top_label=top["label"],
@@ -194,6 +188,7 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         session.commit()
         session.refresh(record)
 
+        # Return response
         return {
             "id": record.id,
             "saved": True,
@@ -208,14 +203,19 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
             "created_at": record.created_at.isoformat(),
         }
 
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
+        # Catch all other exceptions
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+
 
 @app.get("/api/detections")
 def list_detections(limit: int = 50, session: Session = Depends(get_session)):
-    """Most recent detections, newest first."""
+    """Get recent detections."""
     rows = session.exec(
         select(Detection).order_by(Detection.created_at.desc()).limit(limit)
     ).all()
@@ -224,7 +224,7 @@ def list_detections(limit: int = 50, session: Session = Depends(get_session)):
 
 @app.get("/api/stats")
 def get_stats(session: Session = Depends(get_session)):
-    """Aggregate real detection history for the dashboard."""
+    """Get aggregated statistics for dashboard."""
     detections = session.exec(select(Detection)).all()
     total = len(detections)
 
@@ -242,6 +242,7 @@ def get_stats(session: Session = Depends(get_session)):
     avg_risk = round(sum(d.risk_score for d in detections) / total, 2)
     avg_confidence = round(sum(d.top_confidence for d in detections) / total, 1)
 
+    # Label breakdown
     label_counts = defaultdict(int)
     for d in detections:
         label_counts[d.top_label] += 1
@@ -250,11 +251,13 @@ def get_stats(session: Session = Depends(get_session)):
         for k, v in sorted(label_counts.items(), key=lambda x: -x[1])
     ]
 
+    # Priority breakdown
     priority_counts = defaultdict(int)
     for d in detections:
         priority_counts[d.cleanup_priority] += 1
     priority_breakdown = [{"priority": k, "count": v} for k, v in priority_counts.items()]
 
+    # Weekly trend
     today = datetime.now(timezone.utc).date()
     days = [today - timedelta(days=i) for i in range(6, -1, -1)]
     day_counts = defaultdict(int)
@@ -265,6 +268,7 @@ def get_stats(session: Session = Depends(get_session)):
         for d in days
     ]
 
+    # Recent detections
     recent = sorted(detections, key=lambda d: d.created_at, reverse=True)[:10]
     recent_out = [
         {
