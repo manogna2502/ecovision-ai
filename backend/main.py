@@ -53,7 +53,11 @@ app = FastAPI(title="EcoVision AI Detection API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://ecovision-ai-nine.vercel.app",
+        "http://localhost:5173",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -132,61 +136,87 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         raise HTTPException(status_code=400, detail="Please upload an image file.")
 
     raw = await file.read()
+
     try:
         image = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read image file.")
 
-    processor, model = get_model()
+    try:
+        # Load model
+        processor, model = get_model()
 
-    start = time.time()
-    inputs = processor(images=image, return_tensors="pt")
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        probs = torch.nn.functional.softmax(logits, dim=-1)[0]
-    inference_ms = round((time.time() - start) * 1000, 1)
+        start = time.time()
 
-    id2label = model.config.id2label
-    predictions = sorted(
-        [
-            {"label": id2label[i], "confidence": round(float(p) * 100, 1)}
-            for i, p in enumerate(probs)
-        ],
-        key=lambda x: x["confidence"],
-        reverse=True,
-    )
+        inputs = processor(images=image, return_tensors="pt")
 
-    top = predictions[0]
-    score, risk, priority = risk_from_prediction(top["label"], top["confidence"] / 100)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.nn.functional.softmax(logits, dim=-1)[0]
 
-    record = Detection(
-        filename=file.filename,
-        top_label=top["label"],
-        top_confidence=top["confidence"],
-        predictions=predictions,
-        risk_score=score,
-        risk_level=risk,
-        cleanup_priority=priority,
-        inference_ms=inference_ms,
-        model=MODEL_NAME,
-    )
-    session.add(record)
-    session.commit()
-    session.refresh(record)
+        inference_ms = round((time.time() - start) * 1000, 1)
 
-    return {
-        "id": record.id,
-        "saved": True,
-        "predictions": predictions,
-        "top_label": top["label"],
-        "top_confidence": top["confidence"],
-        "risk_score": score,
-        "risk_level": risk,
-        "cleanup_priority": priority,
-        "inference_ms": inference_ms,
-        "model": MODEL_NAME,
-        "created_at": record.created_at.isoformat(),
-    }
+        id2label = model.config.id2label
+
+        predictions = sorted(
+            [
+                {
+                    "label": id2label[i],
+                    "confidence": round(float(p) * 100, 1),
+                }
+                for i, p in enumerate(probs)
+            ],
+            key=lambda x: x["confidence"],
+            reverse=True,
+        )
+
+        top = predictions[0]
+
+        score, risk, priority = risk_from_prediction(
+            top["label"],
+            top["confidence"] / 100,
+        )
+
+        record = Detection(
+            filename=file.filename,
+            top_label=top["label"],
+            top_confidence=top["confidence"],
+            predictions=predictions,
+            risk_score=score,
+            risk_level=risk,
+            cleanup_priority=priority,
+            inference_ms=inference_ms,
+            model=MODEL_NAME,
+        )
+
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+
+        return {
+            "id": record.id,
+            "saved": True,
+            "predictions": predictions,
+            "top_label": top["label"],
+            "top_confidence": top["confidence"],
+            "risk_score": score,
+            "risk_level": risk,
+            "cleanup_priority": priority,
+            "inference_ms": inference_ms,
+            "model": MODEL_NAME,
+            "created_at": record.created_at.isoformat(),
+        }
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Detection failed: {str(e)}"
+        )
 
 
 @app.get("/api/detections")
