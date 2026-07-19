@@ -132,99 +132,86 @@ def health(session: Session = Depends(get_session)):
 
 @app.post("/api/detect")
 async def detect(file: UploadFile = File(...), session: Session = Depends(get_session)):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Please upload an image file.")
-
-    raw = await file.read()
-
-    print("Filename:", file.filename)
-    print("Content Type:", file.content_type)
-    print("Image Size:", len(raw))
-
     try:
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Please upload an image file.")
+
+        raw = await file.read()
+
+        print("Filename:", file.filename)
+        print("Content Type:", file.content_type)
+        print("Image Size:", len(raw))
+
         image = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as e:
-        print("IMAGE ERROR:", str(e))
-        raise HTTPException(status_code=400, detail=str(e))
 
-    try:
         processor, model = get_model()
-    except Exception as e:
-        print("MODEL ERROR:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
 
-    start = time.time()
+        start = time.time()
 
-    inputs = processor(images=image, return_tensors="pt")
+        inputs = processor(images=image, return_tensors="pt")
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        logits = outputs.logits
-        probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.nn.functional.softmax(logits, dim=-1)[0]
 
-    inference_ms = round((time.time() - start) * 1000, 1)
+        inference_ms = round((time.time() - start) * 1000, 1)
 
-    id2label = model.config.id2label
+        id2label = model.config.id2label
 
-    predictions = sorted(
-        [
-            {
-                "label": id2label[i],
-                "confidence": round(float(p) * 100, 1),
-            }
-            for i, p in enumerate(probs)
-        ],
-        key=lambda x: x["confidence"],
-        reverse=True,
-    )
+        predictions = sorted(
+            [
+                {
+                    "label": id2label[i],
+                    "confidence": round(float(p) * 100, 1),
+                }
+                for i, p in enumerate(probs)
+            ],
+            key=lambda x: x["confidence"],
+            reverse=True,
+        )
 
-    top = predictions[0]
+        top = predictions[0]
 
-    score, risk, priority = risk_from_prediction(
-        top["label"],
-        top["confidence"] / 100,
-    )
+        score, risk, priority = risk_from_prediction(
+            top["label"],
+            top["confidence"] / 100,
+        )
 
-    record = Detection(
-        filename=file.filename,
-        top_label=top["label"],
-        top_confidence=top["confidence"],
-        predictions=predictions,
-        risk_score=score,
-        risk_level=risk,
-        cleanup_priority=priority,
-        inference_ms=inference_ms,
-        model=MODEL_NAME,
-    )
+        record = Detection(
+            filename=file.filename,
+            top_label=top["label"],
+            top_confidence=top["confidence"],
+            predictions=predictions,
+            risk_score=score,
+            risk_level=risk,
+            cleanup_priority=priority,
+            inference_ms=inference_ms,
+            model=MODEL_NAME,
+        )
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
+        session.add(record)
+        session.commit()
+        session.refresh(record)
 
-    return {
-        "id": record.id,
-        "saved": True,
-        "predictions": predictions,
-        "top_label": top["label"],
-        "top_confidence": top["confidence"],
-        "risk_score": score,
-        "risk_level": risk,
-        "cleanup_priority": priority,
-        "inference_ms": inference_ms,
-        "model": MODEL_NAME,
-        "created_at": record.created_at.isoformat(),
-    }
+        return {
+            "id": record.id,
+            "saved": True,
+            "predictions": predictions,
+            "top_label": top["label"],
+            "top_confidence": top["confidence"],
+            "risk_score": score,
+            "risk_level": risk,
+            "cleanup_priority": priority,
+            "inference_ms": inference_ms,
+            "model": MODEL_NAME,
+            "created_at": record.created_at.isoformat(),
+        }
 
     except Exception as e:
         import traceback
-
         traceback.print_exc()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Detection failed: {str(e)}"
-        )
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/detections")
 def list_detections(limit: int = 50, session: Session = Depends(get_session)):
