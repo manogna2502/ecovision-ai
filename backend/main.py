@@ -1,23 +1,22 @@
 import io
 import os
 import time
-import gc
+import httpx
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from typing import List, Optional
-import torch
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from sqlalchemy import Column, JSON, func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from transformers import AutoImageProcessor, SiglipForImageClassification
 
 load_dotenv()
 
 MODEL_NAME = "prithivMLmods/Trash-Net"
+HF_TOKEN = os.getenv("HF_TOKEN")  # REQUIRED now - set this in Render env vars
+HF_API_URL = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"
 
 # --- Database setup -------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ecovision.db")
@@ -48,11 +47,10 @@ def get_session():
 
 # --- App setup --------------------------------------------------------------
 app = FastAPI(title="EcoVision AI Detection API")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://ecovision-ai-nine.vercel.app",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,26 +62,6 @@ def on_startup():
     SQLModel.metadata.create_all(engine)
 
 
-@lru_cache(maxsize=1)
-def get_model():
-    """Load model + processor once and cache them across requests.
-    
-    Quantized to int8 for memory efficiency on free-tier Render (512MB RAM).
-    """
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-    model = SiglipForImageClassification.from_pretrained(
-        MODEL_NAME, low_cpu_mem_usage=True
-    )
-    model.eval()
-    quantized_model = torch.quantization.quantize_dynamic(
-        model, {torch.nn.Linear}, dtype=torch.qint8
-    )
-    del model
-    gc.collect()
-    return processor, quantized_model
-
-
-# Risk weighting per waste class
 CLASS_RISK_WEIGHT = {
     "cardboard": 0.2,
     "paper": 0.2,
@@ -95,7 +73,6 @@ CLASS_RISK_WEIGHT = {
 
 
 def risk_from_prediction(label: str, confidence: float):
-    """Calculate risk score from label and confidence."""
     base = CLASS_RISK_WEIGHT.get(label.lower(), 0.5)
     score = round(base * confidence * 10, 1)
 
@@ -113,65 +90,72 @@ def risk_from_prediction(label: str, confidence: float):
 
 @app.get("/api/health")
 def health(session: Session = Depends(get_session)):
-    """Health check endpoint."""
     db_ok = True
     try:
         session.exec(select(func.count(Detection.id))).one()
     except Exception:
         db_ok = False
-    return {"status": "ok", "model": MODEL_NAME, "database_connected": db_ok}
+    return {"status": "ok", "model": MODEL_NAME, "database_connected": db_ok, "hf_token_set": bool(HF_TOKEN)}
 
 
 @app.post("/api/detect")
 async def detect(file: UploadFile = File(...), session: Session = Depends(get_session)):
-    """Main detection endpoint - classify waste image."""
     try:
-        # Validate file is an image
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Please upload an image file.")
 
-        # Read file
+        if not HF_TOKEN:
+            raise HTTPException(
+                status_code=500,
+                detail="HF_TOKEN not configured on the server. Set it in Render environment variables.",
+            )
+
         raw = await file.read()
-        print(f"Filename: {file.filename}, Size: {len(raw)} bytes")
 
-        # Load image
+        # Re-encode to a smaller JPEG to keep the request light and fast
         image = Image.open(io.BytesIO(raw)).convert("RGB")
+        image.thumbnail((512, 512))
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=85)
+        payload = buf.getvalue()
 
-        # Get model
-        processor, model = get_model()
-
-        # Run inference
         start = time.time()
-        inputs = processor(images=image, return_tensors="pt")
 
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits
-            probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                HF_API_URL,
+                headers={
+                    "Authorization": f"Bearer {HF_TOKEN}",
+                    "Content-Type": "image/jpeg",
+                },
+                content=payload,
+            )
 
         inference_ms = round((time.time() - start) * 1000, 1)
 
-        # Format predictions
-        id2label = model.config.id2label
+        if resp.status_code == 503:
+            # Model is cold-loading on HF's side, ask the client to retry shortly
+            raise HTTPException(
+                status_code=503,
+                detail="Model is warming up on Hugging Face, please retry in a few seconds.",
+            )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"HF Inference API error: {resp.text}")
+
+        hf_predictions = resp.json()
+        # HF image-classification pipeline returns [{"label": ..., "score": 0-1}, ...]
         predictions = sorted(
             [
-                {
-                    "label": id2label[i],
-                    "confidence": round(float(p) * 100, 1),
-                }
-                for i, p in enumerate(probs)
+                {"label": p["label"], "confidence": round(float(p["score"]) * 100, 1)}
+                for p in hf_predictions
             ],
             key=lambda x: x["confidence"],
             reverse=True,
         )
 
         top = predictions[0]
-        score, risk, priority = risk_from_prediction(
-            top["label"],
-            top["confidence"] / 100,
-        )
+        score, risk, priority = risk_from_prediction(top["label"], top["confidence"] / 100)
 
-        # Save to database
         record = Detection(
             filename=file.filename,
             top_label=top["label"],
@@ -188,7 +172,6 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         session.commit()
         session.refresh(record)
 
-        # Return response
         return {
             "id": record.id,
             "saved": True,
@@ -204,10 +187,8 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         }
 
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        # Catch all other exceptions
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
@@ -215,7 +196,6 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
 
 @app.get("/api/detections")
 def list_detections(limit: int = 50, session: Session = Depends(get_session)):
-    """Get recent detections."""
     rows = session.exec(
         select(Detection).order_by(Detection.created_at.desc()).limit(limit)
     ).all()
@@ -224,7 +204,6 @@ def list_detections(limit: int = 50, session: Session = Depends(get_session)):
 
 @app.get("/api/stats")
 def get_stats(session: Session = Depends(get_session)):
-    """Get aggregated statistics for dashboard."""
     detections = session.exec(select(Detection)).all()
     total = len(detections)
 
@@ -242,7 +221,6 @@ def get_stats(session: Session = Depends(get_session)):
     avg_risk = round(sum(d.risk_score for d in detections) / total, 2)
     avg_confidence = round(sum(d.top_confidence for d in detections) / total, 1)
 
-    # Label breakdown
     label_counts = defaultdict(int)
     for d in detections:
         label_counts[d.top_label] += 1
@@ -251,13 +229,11 @@ def get_stats(session: Session = Depends(get_session)):
         for k, v in sorted(label_counts.items(), key=lambda x: -x[1])
     ]
 
-    # Priority breakdown
     priority_counts = defaultdict(int)
     for d in detections:
         priority_counts[d.cleanup_priority] += 1
     priority_breakdown = [{"priority": k, "count": v} for k, v in priority_counts.items()]
 
-    # Weekly trend
     today = datetime.now(timezone.utc).date()
     days = [today - timedelta(days=i) for i in range(6, -1, -1)]
     day_counts = defaultdict(int)
@@ -268,7 +244,6 @@ def get_stats(session: Session = Depends(get_session)):
         for d in days
     ]
 
-    # Recent detections
     recent = sorted(detections, key=lambda d: d.created_at, reverse=True)[:10]
     recent_out = [
         {
