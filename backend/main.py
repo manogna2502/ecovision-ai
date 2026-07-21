@@ -62,6 +62,32 @@ def on_startup():
     SQLModel.metadata.create_all(engine)
 
 
+@app.on_event("startup")
+async def warm_up_model():
+    """Fire a tiny request to HF at startup so the model is already loaded
+    on their servers before a real user request comes in and hits Render's
+    30s gateway timeout during a cold start."""
+    if not HF_TOKEN:
+        return
+    try:
+        tiny = Image.new("RGB", (32, 32), color="white")
+        buf = io.BytesIO()
+        tiny.save(buf, format="JPEG")
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(
+                HF_API_URL,
+                headers={
+                    "Authorization": f"Bearer {HF_TOKEN}",
+                    "Content-Type": "image/jpeg",
+                    "X-Wait-For-Model": "true",
+                },
+                content=buf.getvalue(),
+            )
+        print("HF model warm-up request sent.")
+    except Exception as e:
+        print(f"HF warm-up failed (non-fatal): {e}")
+
+
 CLASS_RISK_WEIGHT = {
     "cardboard": 0.2,
     "paper": 0.2,
@@ -121,12 +147,13 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
 
         start = time.time()
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post(
                 HF_API_URL,
                 headers={
                     "Authorization": f"Bearer {HF_TOKEN}",
                     "Content-Type": "image/jpeg",
+                    "X-Wait-For-Model": "true",
                 },
                 content=payload,
             )
@@ -188,6 +215,11 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
 
     except HTTPException:
         raise
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=503,
+            detail="The AI model is still warming up. Please try again in 15-20 seconds.",
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
