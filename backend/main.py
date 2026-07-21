@@ -16,7 +16,7 @@ load_dotenv()
 
 MODEL_NAME = "prithivMLmods/Trash-Net"
 HF_TOKEN = os.getenv("HF_TOKEN")  # REQUIRED now - set this in Render env vars
-HF_API_URL = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"
+HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{MODEL_NAME}"
 
 # --- Database setup -------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ecovision.db")
