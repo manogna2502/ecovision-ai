@@ -1,22 +1,31 @@
 import io
 import os
 import time
-import httpx
+import gc
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import List, Optional
+
+# Limit torch/BLAS threads BEFORE importing torch - reduces peak memory and
+# avoids the free-tier CPU getting thrashed by a multi-threaded matmul.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import torch
+torch.set_num_threads(1)
+
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from sqlalchemy import Column, JSON, func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+from transformers import AutoImageProcessor, SiglipForImageClassification
 
 load_dotenv()
 
 MODEL_NAME = "prithivMLmods/Trash-Net"
-HF_TOKEN = os.getenv("HF_TOKEN")  # REQUIRED now - set this in Render env vars
-HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{MODEL_NAME}"
 
 # --- Database setup -------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ecovision.db")
@@ -63,29 +72,40 @@ def on_startup():
 
 
 @app.on_event("startup")
-async def warm_up_model():
-    """Fire a tiny request to HF at startup so the model is already loaded
-    on their servers before a real user request comes in and hits Render's
-    30s gateway timeout during a cold start."""
-    if not HF_TOKEN:
-        return
-    try:
-        tiny = Image.new("RGB", (32, 32), color="white")
-        buf = io.BytesIO()
-        tiny.save(buf, format="JPEG")
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            warm_resp = await client.post(
-                HF_API_URL,
-                headers={
-                    "Authorization": f"Bearer {HF_TOKEN}",
-                    "Content-Type": "image/jpeg",
-                    "X-Wait-For-Model": "true",
-                },
-                content=buf.getvalue(),
-            )
-        print(f"HF model warm-up response: {warm_resp.status_code} - {warm_resp.text[:500]}")
-    except Exception as e:
-        print(f"HF warm-up failed (non-fatal): {e}")
+def load_model_on_startup():
+    """Load the model once at boot instead of on first request.
+
+    This means the first user never pays the ~10-20s model-load cost, and it
+    lets us see immediately in the logs if loading itself is the problem
+    (rather than finding out only when a real request comes in).
+    """
+    get_model()
+    print("Model loaded and ready at startup.")
+
+
+@lru_cache(maxsize=1)
+def get_model():
+    """Load model + processor once and cache them across requests.
+
+    Memory optimizations applied:
+    - CPU-only torch build (no unused CUDA libs loaded into memory)
+    - low_cpu_mem_usage avoids a duplicate copy of weights during load
+    - dynamic int8 quantization on Linear layers shrinks the resident
+      footprint of the largest layers substantially
+    - torch.set_num_threads(1) avoids extra thread-local buffer overhead
+    - explicit del + gc.collect() drops the unquantized fp32 copy immediately
+    """
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+    model = SiglipForImageClassification.from_pretrained(
+        MODEL_NAME, low_cpu_mem_usage=True, torch_dtype=torch.float32
+    )
+    model.eval()
+    quantized_model = torch.quantization.quantize_dynamic(
+        model, {torch.nn.Linear}, dtype=torch.qint8
+    )
+    del model
+    gc.collect()
+    return processor, quantized_model
 
 
 CLASS_RISK_WEIGHT = {
@@ -121,7 +141,13 @@ def health(session: Session = Depends(get_session)):
         session.exec(select(func.count(Detection.id))).one()
     except Exception:
         db_ok = False
-    return {"status": "ok", "model": MODEL_NAME, "database_connected": db_ok, "hf_token_set": bool(HF_TOKEN)}
+    model_loaded = get_model.cache_info().currsize > 0
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "database_connected": db_ok,
+        "model_loaded": model_loaded,
+    }
 
 
 @app.post("/api/detect")
@@ -130,53 +156,42 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Please upload an image file.")
 
-        if not HF_TOKEN:
-            raise HTTPException(
-                status_code=500,
-                detail="HF_TOKEN not configured on the server. Set it in Render environment variables.",
-            )
-
         raw = await file.read()
 
-        # Re-encode to a smaller JPEG to keep the request light and fast
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
-        image.thumbnail((512, 512))
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=85)
-        payload = buf.getvalue()
+        try:
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Couldn't read that file as an image. Try a JPG or PNG.",
+            )
+
+        # Downscale before inference - the model's own processor will resize
+        # to its expected input size anyway, so there's no accuracy cost, but
+        # it keeps peak memory during preprocessing much lower for large
+        # phone-camera photos (4000x3000 etc).
+        image.thumbnail((384, 384))
+
+        processor, model = get_model()
 
         start = time.time()
+        inputs = processor(images=image, return_tensors="pt")
 
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.post(
-                HF_API_URL,
-                headers={
-                    "Authorization": f"Bearer {HF_TOKEN}",
-                    "Content-Type": "image/jpeg",
-                    "X-Wait-For-Model": "true",
-                },
-                content=payload,
-            )
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.nn.functional.softmax(logits, dim=-1)[0]
 
         inference_ms = round((time.time() - start) * 1000, 1)
 
-        if resp.status_code == 503:
-            # Model is cold-loading on HF's side, ask the client to retry shortly
-            print(f"HF API 503 (loading): {resp.text[:500]}")
-            raise HTTPException(
-                status_code=503,
-                detail="Model is warming up on Hugging Face, please retry in a few seconds.",
-            )
-        if resp.status_code != 200:
-            print(f"HF API returned {resp.status_code}: {resp.text[:500]}")
-            raise HTTPException(status_code=502, detail=f"HF Inference API error ({resp.status_code}): {resp.text[:300]}")
-
-        hf_predictions = resp.json()
-        # HF image-classification pipeline returns [{"label": ..., "score": 0-1}, ...]
+        id2label = model.config.id2label
         predictions = sorted(
             [
-                {"label": p["label"], "confidence": round(float(p["score"]) * 100, 1)}
-                for p in hf_predictions
+                {
+                    "label": id2label[i],
+                    "confidence": round(float(p) * 100, 1),
+                }
+                for i, p in enumerate(probs)
             ],
             key=lambda x: x["confidence"],
             reverse=True,
@@ -201,6 +216,10 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         session.commit()
         session.refresh(record)
 
+        # Free intermediate tensors promptly - matters a lot at 512MB.
+        del inputs, outputs, logits, probs
+        gc.collect()
+
         return {
             "id": record.id,
             "saved": True,
@@ -217,11 +236,6 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
 
     except HTTPException:
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=503,
-            detail="The AI model is still warming up. Please try again in 15-20 seconds.",
-        )
     except Exception as e:
         import traceback
         traceback.print_exc()
