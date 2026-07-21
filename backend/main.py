@@ -74,7 +74,7 @@ async def warm_up_model():
         buf = io.BytesIO()
         tiny.save(buf, format="JPEG")
         async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(
+            warm_resp = await client.post(
                 HF_API_URL,
                 headers={
                     "Authorization": f"Bearer {HF_TOKEN}",
@@ -83,7 +83,7 @@ async def warm_up_model():
                 },
                 content=buf.getvalue(),
             )
-        print("HF model warm-up request sent.")
+        print(f"HF model warm-up response: {warm_resp.status_code} - {warm_resp.text[:500]}")
     except Exception as e:
         print(f"HF warm-up failed (non-fatal): {e}")
 
@@ -162,12 +162,14 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
 
         if resp.status_code == 503:
             # Model is cold-loading on HF's side, ask the client to retry shortly
+            print(f"HF API 503 (loading): {resp.text[:500]}")
             raise HTTPException(
                 status_code=503,
                 detail="Model is warming up on Hugging Face, please retry in a few seconds.",
             )
         if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"HF Inference API error: {resp.text}")
+            print(f"HF API returned {resp.status_code}: {resp.text[:500]}")
+            raise HTTPException(status_code=502, detail=f"HF Inference API error ({resp.status_code}): {resp.text[:300]}")
 
         hf_predictions = resp.json()
         # HF image-classification pipeline returns [{"label": ..., "score": 0-1}, ...]
