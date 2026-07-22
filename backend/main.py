@@ -7,25 +7,37 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import List, Optional
 
-# Limit torch/BLAS threads BEFORE importing torch - reduces peak memory and
-# avoids the free-tier CPU getting thrashed by a multi-threaded matmul.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-
-import torch
-torch.set_num_threads(1)
-
+import numpy as np
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from sqlalchemy import Column, JSON, func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from transformers import AutoImageProcessor, SiglipForImageClassification
+from huggingface_hub import hf_hub_download
+import onnxruntime as ort
 
 load_dotenv()
 
-MODEL_NAME = "prithivMLmods/Trash-Net"
+# --- Model config ------------------------------------------------------------
+# Your uploaded ONNX repo - update ONNX_REPO if you re-upload elsewhere.
+ONNX_REPO = "Manogna2502/ecovision-waste-onnx"
+ONNX_FILENAME = "model_quantized.onnx"
+MODEL_NAME = "prithivMLmods/Trash-Net (ONNX, quantized)"
+
+# From your exported config.json / preprocessor_config.json - keep these in
+# sync if you ever re-export with different values.
+ID2LABEL = {
+    0: "cardboard",
+    1: "glass",
+    2: "metal",
+    3: "paper",
+    4: "plastic",
+    5: "trash",
+}
+IMAGE_SIZE = (224, 224)  # (height, width)
+IMAGE_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+IMAGE_STD = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
 # --- Database setup -------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ecovision.db")
@@ -73,39 +85,48 @@ def on_startup():
 
 @app.on_event("startup")
 def load_model_on_startup():
-    """Load the model once at boot instead of on first request.
+    """Download (if needed) and load the ONNX model once at boot.
 
-    This means the first user never pays the ~10-20s model-load cost, and it
-    lets us see immediately in the logs if loading itself is the problem
-    (rather than finding out only when a real request comes in).
+    huggingface_hub caches the download, so redeploys after the first one
+    reuse the cached file rather than re-downloading 80+ MB every time.
     """
-    get_model()
-    print("Model loaded and ready at startup.")
+    get_session_and_model()
+    print("ONNX model loaded and ready at startup.")
 
 
 @lru_cache(maxsize=1)
-def get_model():
-    """Load model + processor once and cache them across requests.
+def get_session_and_model():
+    """Download the quantized ONNX model from the Hub and create an
+    inference session. Cached so this only happens once per process."""
+    model_path = hf_hub_download(repo_id=ONNX_REPO, filename=ONNX_FILENAME)
 
-    Memory optimizations applied:
-    - CPU-only torch build (no unused CUDA libs loaded into memory)
-    - low_cpu_mem_usage avoids a duplicate copy of weights during load
-    - dynamic int8 quantization on Linear layers shrinks the resident
-      footprint of the largest layers substantially
-    - torch.set_num_threads(1) avoids extra thread-local buffer overhead
-    - explicit del + gc.collect() drops the unquantized fp32 copy immediately
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 1
+    so.inter_op_num_threads = 1
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    ort_session = ort.InferenceSession(
+        model_path, sess_options=so, providers=["CPUExecutionProvider"]
+    )
+    input_name = ort_session.get_inputs()[0].name
+    return ort_session, input_name
+
+
+def preprocess_image(image: Image.Image) -> np.ndarray:
+    """Replicates SiglipImageProcessor's preprocessing:
+    resize -> rescale to [0,1] -> normalize with mean/std -> CHW -> batch dim.
     """
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-    model = SiglipForImageClassification.from_pretrained(
-        MODEL_NAME, low_cpu_mem_usage=True, torch_dtype=torch.float32
-    )
-    model.eval()
-    quantized_model = torch.quantization.quantize_dynamic(
-        model, {torch.nn.Linear}, dtype=torch.qint8
-    )
-    del model
-    gc.collect()
-    return processor, quantized_model
+    image = image.resize((IMAGE_SIZE[1], IMAGE_SIZE[0]), Image.BILINEAR)
+    arr = np.asarray(image).astype(np.float32) / 255.0  # rescale_factor
+    arr = (arr - IMAGE_MEAN) / IMAGE_STD  # normalize
+    arr = arr.transpose(2, 0, 1)  # HWC -> CHW
+    arr = np.expand_dims(arr, axis=0)  # add batch dim
+    return arr.astype(np.float32)
+
+
+def softmax(x: np.ndarray) -> np.ndarray:
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
 
 
 CLASS_RISK_WEIGHT = {
@@ -141,7 +162,7 @@ def health(session: Session = Depends(get_session)):
         session.exec(select(func.count(Detection.id))).one()
     except Exception:
         db_ok = False
-    model_loaded = get_model.cache_info().currsize > 0
+    model_loaded = get_session_and_model.cache_info().currsize > 0
     return {
         "status": "ok",
         "model": MODEL_NAME,
@@ -166,31 +187,18 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
                 detail="Couldn't read that file as an image. Try a JPG or PNG.",
             )
 
-        # Downscale before inference - the model's own processor will resize
-        # to its expected input size anyway, so there's no accuracy cost, but
-        # it keeps peak memory during preprocessing much lower for large
-        # phone-camera photos (4000x3000 etc).
-        image.thumbnail((384, 384))
-
-        processor, model = get_model()
+        ort_session, input_name = get_session_and_model()
 
         start = time.time()
-        inputs = processor(images=image, return_tensors="pt")
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits
-            probs = torch.nn.functional.softmax(logits, dim=-1)[0]
-
+        input_array = preprocess_image(image)
+        outputs = ort_session.run(None, {input_name: input_array})
+        logits = outputs[0][0]  # first output, first (only) batch item
+        probs = softmax(logits)
         inference_ms = round((time.time() - start) * 1000, 1)
 
-        id2label = model.config.id2label
         predictions = sorted(
             [
-                {
-                    "label": id2label[i],
-                    "confidence": round(float(p) * 100, 1),
-                }
+                {"label": ID2LABEL[i], "confidence": round(float(p) * 100, 1)}
                 for i, p in enumerate(probs)
             ],
             key=lambda x: x["confidence"],
@@ -216,8 +224,7 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
         session.commit()
         session.refresh(record)
 
-        # Free intermediate tensors promptly - matters a lot at 512MB.
-        del inputs, outputs, logits, probs
+        del input_array, outputs, logits, probs
         gc.collect()
 
         return {
