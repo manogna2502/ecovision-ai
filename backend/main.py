@@ -22,9 +22,8 @@ load_dotenv()
 # --- Model config ------------------------------------------------------------
 # Your uploaded ONNX repo - update ONNX_REPO if you re-upload elsewhere.
 ONNX_REPO = "Manogna2502/ecovision-waste-onnx"
-ONNX_FILENAME = "model_raw.onnx"
-ONNX_DATA_FILENAME = "model_raw.onnx.data"  # external weights file - required
-MODEL_NAME = "prithivMLmods/Trash-Net (ONNX, fp32)"
+ONNX_FILENAME = "model_quantized.onnx"
+MODEL_NAME = "prithivMLmods/Trash-Net (ONNX, quantized)"
 
 # From your exported config.json / preprocessor_config.json - keep these in
 # sync if you ever re-export with different values.
@@ -100,11 +99,6 @@ def get_session_and_model():
     """Download the quantized ONNX model from the Hub and create an
     inference session. Cached so this only happens once per process."""
     model_path = hf_hub_download(repo_id=ONNX_REPO, filename=ONNX_FILENAME)
-    # The external weights file must be downloaded into the exact same local
-    # folder as model_path, since the .onnx graph references it by relative
-    # filename. hf_hub_download's local caching already handles this
-    # correctly as long as both files live in the same repo.
-    hf_hub_download(repo_id=ONNX_REPO, filename=ONNX_DATA_FILENAME)
 
     so = ort.SessionOptions()
     so.intra_op_num_threads = 1
