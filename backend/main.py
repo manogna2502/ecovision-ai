@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
+import pillow_heif
+import pillow_avif  # noqa: F401 - importing this registers the AVIF opener with PIL
+
+pillow_heif.register_heif_opener()  # registers HEIC/HEIF opener with PIL
 from sqlalchemy import Column, JSON, func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from huggingface_hub import hf_hub_download
@@ -181,7 +185,12 @@ async def detect(file: UploadFile = File(...), session: Session = Depends(get_se
 
         try:
             image = Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception:
+        except Exception as img_err:
+            print(
+                f"Image decode failed - filename={file.filename!r} "
+                f"content_type={file.content_type!r} size={len(raw)} bytes "
+                f"error={img_err!r}"
+            )
             raise HTTPException(
                 status_code=400,
                 detail="Couldn't read that file as an image. Try a JPG or PNG.",
