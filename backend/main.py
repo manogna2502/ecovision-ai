@@ -26,8 +26,8 @@ load_dotenv()
 # --- Model config ------------------------------------------------------------
 # Your uploaded ONNX repo - update ONNX_REPO if you re-upload elsewhere.
 ONNX_REPO = "Manogna2502/ecovision-waste-onnx"
-ONNX_FILENAME = "model_quantized.onnx"
-MODEL_NAME = "prithivMLmods/Trash-Net (ONNX, quantized)"
+ONNX_FILENAME = "model_quantized_v2.onnx"
+MODEL_NAME = "prithivMLmods/Trash-Net (ONNX, mixed-precision quantized)"
 
 # From your exported config.json / preprocessor_config.json - keep these in
 # sync if you ever re-export with different values.
