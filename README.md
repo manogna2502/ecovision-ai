@@ -1,153 +1,143 @@
 # EcoVision AI
 
-AI-powered waste triage — upload a photo, get real computer vision waste
-classification plus a rule-based risk/priority score, backed by a real
-Postgres database. Built for Idea2Impact 2026 (Theme 2 · Clean & Green
-Technology), architected to keep going as a real product afterward.
+EcoVision AI is a full-stack waste classification platform. Upload a photo
+of waste and it identifies the material type, estimates a risk score, and
+assigns a cleanup priority — all backed by a real, deployed AI model and a
+live database, not a mock or a demo script.
+
+It was built for Idea2Impact 2026 (Theme 2 — Clean & Green Technology), with
+an eye toward staying useful as a real tool beyond the hackathon itself.
+
+## What it does
+
+You upload an image on the AI Detection page, and the backend runs it
+through a computer vision model trained to recognize six waste categories:
+cardboard, glass, metal, paper, plastic, and trash. It returns a confidence
+score for each category, a risk level, and a cleanup priority, and saves the
+result to a Postgres database. From there, the Dashboard, Analytics, and AI
+Insights pages all pull from that same real detection history — nothing on
+those pages is placeholder data.
+
+Two pages, Smart Bins and Fleet, are honestly labeled as derived from real
+detection counts rather than live sensor data, since there's no physical
+IoT or GPS hardware deployed yet. They're clearly marked as such in the UI
+itself, so there's no ambiguity about what's live versus illustrative.
+
+## How the AI model works
+
+The classifier is based on `prithivMLmods/Trash-Net`, a SigLIP vision
+transformer fine-tuned for waste classification. Hosting a model like this
+affordably turned out to be the hardest engineering problem in this
+project, and it's worth explaining honestly:
+
+- Hugging Face's free hosted Inference API doesn't support this model on
+  their serverless provider, so that route wasn't usable.
+- Loading the original PyTorch model directly in the backend consistently
+  ran out of memory on a free-tier server (512MB RAM), even after dynamic
+  quantization.
+- The working solution was to export the model to ONNX format, quantize it
+  to int8 for a smaller footprint, and serve it with ONNX Runtime instead
+  of PyTorch. This dropped the memory footprint enough to run reliably on a
+  free-tier instance.
+- Full int8 quantization on every layer noticeably hurt accuracy on some
+  images, particularly the model's final classification layer. The current
+  version keeps that final layer (and the layer feeding into it) in full
+  precision while quantizing the rest, which meaningfully improved
+  real-world accuracy while keeping almost all of the original size
+  savings.
+
+The model itself only recognizes the six categories it was trained on. It
+has no "organic" or "food waste" category, so a photo of something like
+food scraps will always be misclassified into one of the six trained
+categories — that's a limitation of the underlying pretrained model, not a
+bug in this app.
+
+## Project structure
 
 ```
-ecovision-project/
-├── frontend/     React + Vite, JavaScript only (no TypeScript)
+ecovision-ai-project/
+├── frontend/     React + Vite, JavaScript
 │   └── src/
-│       ├── pages/          Route-level pages (Home, Dashboard, Detection, Analytics, Reports, About)
+│       ├── pages/          Route-level pages: Home, Dashboard, Detection,
+│       │                   Analytics, Reports, AI Insights, Smart Bins,
+│       │                   Fleet, Settings, About
 │       ├── components/
-│       │   ├── ui/         shadcn-style primitives (Button, Card, Badge, Skeleton) — plain JS
-│       │   ├── layout/     Navbar, Sidebar, Footer, page layouts
-│       │   ├── landing/    Hero, Features, Stats, Insights, etc.
-│       │   └── dashboard/  KPI cards, charts, tables, alerts
+│       │   ├── ui/         Small reusable primitives (Button, Card, Badge)
+│       │   ├── layout/     Navbar, Sidebar, page layouts
+│       │   └── dashboard/  KPI cards, charts, tables
 │       ├── hooks/           useStats, useTheme
-│       └── lib/             axios API client, cn() utility
-└── backend/      FastAPI + SigLIP classifier + Postgres (SQLModel)
+│       └── lib/             API client, small utilities
+└── backend/      FastAPI + ONNX Runtime + Postgres (SQLModel)
 ```
 
-**Stack:** React + Vite, JavaScript (no TypeScript anywhere), Tailwind CSS,
-hand-written shadcn-style components, Framer Motion, React Router, Recharts,
-Lucide icons, Axios.
+**Frontend:** React, Vite, Tailwind CSS, Framer Motion, React Router,
+Recharts, Lucide icons, Axios, jsPDF for report export.
 
-**Honesty note:** feature cards on the landing page are labeled "Live" or
-"Planned." Live means wired to the real model and real database — try it.
-Planned means UI-shell only (IoT bin sensors, fleet GPS, the AI chat
-assistant) — infrastructure this build doesn't have yet. Worth saying
-plainly in your submission rather than letting judges find the gap.
+**Backend:** FastAPI, ONNX Runtime, Postgres via SQLModel, Hugging Face Hub
+(used only to download the model file at startup).
 
-## Today's checklist (deploy day)
+## Running it locally
 
-- [ ] 1. Set up Supabase database (free tier)
-- [ ] 2. Test backend locally, confirm DB connects
-- [ ] 3. Test frontend locally, pointed at local backend
-- [ ] 4. Push to a public GitHub repo
-- [ ] 5. Deploy backend (Render or HF Spaces), with DATABASE_URL set
-- [ ] 6. Deploy frontend (Vercel), pointed at the deployed backend
-- [ ] 7. Test the live deployed link from your phone or another device
-- [ ] 8. Fill README with setup instructions for judges
-
----
-
-## 1. Set up the database
-
-See `backend/README.md` section "1. Set up the database" for the full
-Supabase walkthrough (~5 min, free tier). You'll end up with a
-`DATABASE_URL` connection string — keep it handy for the next two steps.
-
-## 2. Run the backend locally
+### Backend
 
 ```bash
 cd backend
 pip install -r requirements.txt
 cp .env.example .env
-# paste your Supabase DATABASE_URL into .env
+# add your DATABASE_URL to .env
 uvicorn main:app --reload --port 8000
 ```
 
-First request downloads the model (~350MB) — wait for it to finish. Test:
+The first request downloads the quantized ONNX model from Hugging Face
+(about 80MB) and caches it locally. Check that everything is working:
 
 ```bash
 curl http://localhost:8000/api/health
-# should show "database_connected": true
-curl -X POST http://localhost:8000/api/detect -F "file=@/path/to/any/trash/photo.jpg"
-curl http://localhost:8000/api/stats
+# should return "database_connected": true and "model_loaded": true
+
+curl -X POST http://localhost:8000/api/detect -F "file=@/path/to/photo.jpg"
 ```
 
-You must see `database_connected: true` and real JSON with predictions
-before moving on — if the DB isn't connected, fix that first.
-
-## 3. Run the frontend locally
+### Frontend
 
 ```bash
 cd frontend
 npm install
-cp .env.example .env    # defaults to localhost:8000, fine for local dev
+cp .env.example .env
 npm run dev
 ```
 
-Opens at `http://localhost:5173`. It defaults to calling
-`http://localhost:8000` for detection, so with the backend running in another
-terminal, upload an image on the AI Detection page and confirm you see real
-confidence bars (not instant/fake results).
+Opens at `http://localhost:5173`. With the backend running locally too,
+upload a photo on the AI Detection page and confirm you get real confidence
+scores back, not placeholder numbers.
 
-## 4. Push to GitHub
+## Deployment
 
-```bash
-cd ecovision-project
-git init
-git add .
-git commit -m "EcoVision AI - initial build"
-```
+The live version runs the backend on Render and the frontend on Vercel.
+The backend downloads its model from a public Hugging Face model repo at
+startup rather than bundling it, which keeps the deployed image small and
+avoids re-uploading an 80MB file on every deploy.
 
-Then on github.com: create a **new public repository** (no README/license —
-you already have one), copy the commands it shows you, e.g.:
+## Honest limitations
 
-```bash
-git remote add origin https://github.com/<your-username>/ecovision-ai.git
-git branch -M main
-git push -u origin main
-```
+This section exists on purpose, since it's better for judges (or anyone
+else) to hear these from us directly:
 
-Keep this repo public through 23 July (evaluation window) per the hackathon rules.
-
-## 5. Deploy the backend
-
-**Render (recommended, simplest for FastAPI):**
-1. https://render.com → New → Web Service → connect your GitHub repo
-2. Root directory: `backend`
-3. Runtime: Docker (it will pick up `backend/Dockerfile` automatically)
-4. **Environment → Add Environment Variable**: `DATABASE_URL` = your Supabase
-   connection string from step 1 (same value you put in `backend/.env`)
-5. Instance type: Free is fine for a demo
-6. Deploy — first build takes a few minutes. Copy the resulting URL, e.g.
-   `https://ecovision-ai-xxxx.onrender.com`
-7. Confirm it works: `curl https://ecovision-ai-xxxx.onrender.com/api/health`
-   — check for `"database_connected": true`
-
-Note: Render's free tier spins down when idle and takes ~30-60s to wake up
-on the first request after sleeping. Mention this in your demo video if the
-detection call is slow on first click — it's expected, not a bug.
-
-**Alternative — Hugging Face Spaces:** create a new Space, SDK = Docker,
-upload the contents of `backend/`. Good option since the model itself is
-already hosted on HF.
-
-## 6. Deploy the frontend
-
-**Vercel:**
-1. https://vercel.com → Add New → Project → import the same GitHub repo
-2. Root directory: `frontend`
-3. Framework preset: Vite (should auto-detect)
-4. Environment variable: `VITE_API_URL` = your backend URL from step 4
-   (e.g. `https://ecovision-ai-xxxx.onrender.com`)
-5. Deploy — you'll get a URL like `https://ecovision-ai.vercel.app`
-
-## 7. Test from a different device
-
-Open the Vercel URL on your phone (not the same wifi/laptop you built on).
-Upload a real photo on the AI Detection page. If it works here, it'll work
-for judges. This step catches CORS issues, sleeping backends, and env
-variable typos before submission — don't skip it.
-
-## 8. Submission checklist
-
-- [ ] GitHub repo public, README explains setup + tech stack
-- [ ] Deployed link works from a different device, no login required
-- [ ] Problem statement doc (1-2 pages) written
-- [ ] 2-3 min demo video recorded: problem → solution → AI in action → impact
-- [ ] All 5 items filled into the Submission Form before 19 July 11:59 PM
+- Smart Bins and Fleet show numbers derived from real detection data, not
+  live sensor or GPS telemetry — that hardware doesn't exist yet.
+- The model doesn't recognize organic/food waste as a category, so photos
+  of food scraps get forced into one of the six trained categories with no
+  correct answer available.
+- The model can misclassify heavily weathered, crumpled, or dirt-covered
+  plastic litter as paper. We verified this is a genuine characteristic of
+  the underlying pretrained model itself, not a bug in our pipeline — the
+  exact same result occurs when running the original, unmodified model
+  directly, with no ONNX conversion or quantization involved. Clean, less
+  cluttered photos of plastic items (e.g. an aluminum can, correctly
+  classified as metal at 99%+ confidence) are classified accurately; it's
+  specifically the crinkled, sun-bleached texture of outdoor plastic litter
+  that appears to visually resemble paper to this model. Improving this
+  would require fine-tuning the model on more real-world weathered litter
+  photos, which is a natural next step beyond this build.
+- It runs on free-tier hosting, so the very first request after a period of
+  inactivity can take longer than usual while the server spins back up.
